@@ -1,0 +1,5 @@
+streamlit>=1.37.0
+requests>=2.32.3
+openai>=1.51.0
+beautifulsoup4>=4.12.3
+
