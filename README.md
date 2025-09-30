@@ -1,4 +1,4 @@
-## AI Brochure Maker (Streamlit)
+## AI Brochure Maker 
 
 Create a polished company brochure draft from a website. The app scrapes the site, filters for relevant pages (e.g., About, Careers), and uses an LLM (via OpenRouter) to produce a well-structured Markdown brochure.
 
