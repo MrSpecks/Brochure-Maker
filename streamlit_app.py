@@ -4,12 +4,18 @@ from urllib.parse import urljoin, urlparse
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-
+from openai import OpenAI # Added import for client initialization
 
 # -----------------------------
 # Streamlit Page Configuration
 # -----------------------------
 st.set_page_config(page_title="AI Brochure Maker", page_icon="🧭", layout="wide")
+
+# Initialize session state for API key and config if not present
+if "api_key" not in st.session_state:
+    st.session_state["api_key"] = ""
+if "llm_provider" not in st.session_state:
+    st.session_state["llm_provider"] = "OpenRouter"
 
 
 # -----------------------------
@@ -36,18 +42,42 @@ HTTP_HEADERS = {
     )
 }
 
+# --- New Function to get API key from session state or secrets ---
+def get_api_key(provider: str) -> str:
+    """Retrieves the API key from session state, then secrets, then environment."""
+    
+    # 1. Check user-input key in session state (highest priority for demo)
+    if st.session_state.get("api_key"):
+        return st.session_state["api_key"]
 
-def get_openrouter_key() -> str:
-    # Primary: Streamlit secrets; Fallback: environment variable; else raise
-    key = st.secrets.get("Openrouter_Api_Key") or os.getenv("OPENROUTER_API_KEY")
-    if not key:
-        # As requested, demonstrate the exact access pattern; do not actually use this value here.
-        # Example of direct access if stored exactly in secrets: st.secrets['Openrouter_Api_Key=sk-or-...']
-        raise RuntimeError(
-            "OpenRouter API key not found. Add Openrouter_Api_Key to .streamlit/secrets.toml"
-        )
-    return key
+    # Map provider to expected secret/env key name
+    key_map = {
+        "OpenRouter": ("Openrouter_Api_Key", "OPENROUTER_API_KEY"),
+        "OpenAI": ("Openai_Api_Key", "OPENAI_API_KEY"),
+        "Anthropic": ("Anthropic_Api_Key", "ANTHROPIC_API_KEY"),
+        "Google": ("Google_Api_Key", "GOOGLE_API_KEY"),
+    }
+    
+    secret_key, env_key = key_map.get(provider, ("", ""))
 
+    # 2. Check Streamlit secrets
+    key = st.secrets.get(secret_key)
+    if key:
+        return key
+
+    # 3. Check environment variables
+    key = os.getenv(env_key)
+    if key:
+        return key
+
+    # If no key found, raise a user-friendly error
+    raise RuntimeError(
+        f"API key not found. Please enter your {provider} key in the sidebar."
+    )
+
+
+# --- Replaced get_openrouter_key with the general get_api_key ---
+# The rest of the utilities (fetch_html, extract_relevant_links, scrape_pages, build_prompt) remain unchanged.
 
 @st.cache_data(show_spinner=False)
 def fetch_html(url: str) -> str:
@@ -124,15 +154,35 @@ def build_prompt(company_url: str, page_texts: dict[str, str]) -> list[dict[str,
     ]
 
 
-def generate_brochure(company_url: str, page_texts: dict[str, str]) -> str:
-    # Deferred import to avoid importing if not needed and to keep startup fast
-    from openai import OpenAI
-
-    api_key = get_openrouter_key()
-    client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+# --- Modified generate_brochure to handle multiple providers ---
+def generate_brochure(company_url: str, page_texts: dict[str, str], provider: str) -> str:
+    
+    api_key = get_api_key(provider)
     messages = build_prompt(company_url, page_texts)
+
+    # Configuration mapping: (base_url, model_name)
+    config_map = {
+        "OpenRouter": ("https://openrouter.ai/api/v1", "openrouter/sonoma-dusk-alpha"),
+        "OpenAI": ("https://api.openai.com/v1", "gpt-4-turbo-preview"),
+        "Anthropic": ("https://api.anthropic.com/v1", "claude-3-opus-20240229"), # Note: Anthropic uses a different client/endpoint
+        "Google": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-pro"), # Note: Google uses a different client/endpoint
+    }
+    
+    base_url, model = config_map.get(provider, (None, None))
+    
+    if not base_url:
+        return f"Error: Unsupported provider '{provider}'. Could not configure API client."
+        
+    # NOTE: Anthropic and Google APIs require their specific Python client libraries.
+    # For simplicity and to use the existing `openai` import, we will currently ONLY 
+    # support services compatible with the OpenAI-like API structure (OpenAI, OpenRouter, etc.).
+    if provider in ["Anthropic", "Google"]:
+        return f"Provider '{provider}' selected. This demo currently only supports OpenAI-compatible APIs (OpenAI, OpenRouter) for a unified code structure."
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    
     resp = client.chat.completions.create(
-        model="openrouter/sonoma-dusk-alpha",
+        model=model,
         messages=messages,
         temperature=0.3,
     )
@@ -147,16 +197,46 @@ st.caption(
     "Automatically scrape a company website, select relevant pages, and generate a polished brochure draft."
 )
 
-# Sidebar inputs
-with st.sidebar:
-    st.header("Setup")
-    st.write(
-        "Add `Openrouter_Api_Key` to your `.streamlit/secrets.toml`."
+
+# --- New API Key Configuration Component ---
+def llm_config_selector():
+    st.subheader("API Key & LLM Setup")
+    
+    # 1. Provider Selection
+    provider = st.selectbox(
+        "Select LLM Provider:",
+        options=["OpenRouter", "OpenAI", "Anthropic", "Google"],
+        key="llm_provider",
+        help="Select the API provider you want to use."
     )
-    st.write(
-        "The app reads the key from Streamlit secrets."
+    
+    # 2. Key Input (Stored in session state)
+    st.text_input(
+        f"Paste your {provider} API Key here:",
+        type="password",
+        key="api_key",
+        help=f"Your key is only stored in the current browser session and is never saved.",
+        placeholder="sk-..."
     )
 
+    # 3. Informational Check
+    try:
+        key_status = "✅ Key Loaded" if get_api_key(provider) else "❌ Key Missing"
+    except RuntimeError:
+        key_status = "❌ Key Missing"
+
+    st.info(f"Key Status: **{key_status}**")
+    
+    if provider in ["Anthropic", "Google"]:
+         st.warning(f"Note: {provider} requires a different client. Try OpenAI or OpenRouter for this demo.")
+
+
+# Sidebar inputs
+with st.sidebar:
+    llm_config_selector() # Call the new configuration function
+    st.markdown("---")
+    st.subheader("Website Input")
+    
     default_url = st.session_state.get("input_url", "")
     input_url = st.text_input("Company Website URL", value=default_url, placeholder="https://example.com")
     st.session_state["input_url"] = input_url
@@ -175,15 +255,24 @@ if run:
             st.error("Please provide a valid URL including http:// or https://.")
         else:
             try:
+                # Check for API key before starting long processes
+                provider = st.session_state["llm_provider"]
+                get_api_key(provider) # This will raise RuntimeError if key is missing
+
+                # --- Core Process ---
                 with st.spinner("Fetching landing page..."):
                     html = fetch_html(input_url)
                 with st.spinner("Finding relevant links (About, Careers, etc.)..."):
                     links = extract_relevant_links(input_url, html)
                 with st.spinner("Scraping relevant pages..."):
                     contents = scrape_pages(links)
-                with st.spinner("Generating brochure with OpenRouter..."):
-                    brochure_md = generate_brochure(input_url, contents)
+                
+                # Use the selected provider in the generation step
+                with st.spinner(f"Generating brochure with {provider}..."):
+                    brochure_md = generate_brochure(input_url, contents, provider)
+                # --- End Core Process ---
 
+                # Display Results
                 with col_left:
                     st.subheader("Status & Raw Data")
                     st.markdown("**Relevant links found:**")
@@ -203,7 +292,9 @@ if run:
 
                 with col_right:
                     st.subheader("Final Brochure Draft")
-                    if brochure_md.strip():
+                    if "Error:" in brochure_md: # Check for the error message from generate_brochure
+                         st.error(brochure_md)
+                    elif brochure_md.strip():
                         st.markdown(brochure_md)
                         st.success("Brochure generated successfully.")
                     else:
@@ -212,8 +303,7 @@ if run:
             except requests.exceptions.RequestException as e:
                 st.error(f"Network error while fetching pages: {e}")
             except RuntimeError as e:
+                # Catches the RuntimeError from get_api_key
                 st.error(str(e))
             except Exception as e:
                 st.error(f"Unexpected error: {e}")
-
-
