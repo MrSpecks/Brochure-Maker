@@ -4,7 +4,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from openai import OpenAI # Added import for client initialization
+from openai import OpenAI, APIError
 
 # -----------------------------
 # Streamlit Page Configuration
@@ -16,6 +16,28 @@ if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 if "llm_provider" not in st.session_state:
     st.session_state["llm_provider"] = "OpenRouter"
+if "selected_model" not in st.session_state:
+    st.session_state["selected_model"] = ""
+
+# -----------------------------
+# LLM Configuration Mappings
+# -----------------------------
+# Configuration mapping for providers compatible with the OpenAI Python SDK
+LLM_CONFIGS = {
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "meta-llama/llama-3.2-3b-instruct:free",
+        "secret_key_name": "Openrouter_Api_Key",
+        "env_key_name": "OPENROUTER_API_KEY",
+    },
+    "OpenAI": {
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o",
+        "secret_key_name": "Openai_Api_Key",
+        "env_key_name": "OPENAI_API_KEY",
+    },
+    # Anthropic and Google are noted as incompatible with the unified OpenAI client below
+}
 
 
 # -----------------------------
@@ -42,7 +64,7 @@ HTTP_HEADERS = {
     )
 }
 
-# --- New Function to get API key from session state or secrets ---
+
 def get_api_key(provider: str) -> str:
     """Retrieves the API key from session state, then secrets, then environment."""
     
@@ -50,15 +72,9 @@ def get_api_key(provider: str) -> str:
     if st.session_state.get("api_key"):
         return st.session_state["api_key"]
 
-    # Map provider to expected secret/env key name
-    key_map = {
-        "OpenRouter": ("Openrouter_Api_Key", "OPENROUTER_API_KEY"),
-        "OpenAI": ("Openai_Api_Key", "OPENAI_API_KEY"),
-        "Anthropic": ("Anthropic_Api_Key", "ANTHROPIC_API_KEY"),
-        "Google": ("Google_Api_Key", "GOOGLE_API_KEY"),
-    }
-    
-    secret_key, env_key = key_map.get(provider, ("", ""))
+    config = LLM_CONFIGS.get(provider, {})
+    secret_key = config.get("secret_key_name", "")
+    env_key = config.get("env_key_name", "")
 
     # 2. Check Streamlit secrets
     key = st.secrets.get(secret_key)
@@ -76,9 +92,6 @@ def get_api_key(provider: str) -> str:
     )
 
 
-# --- Replaced get_openrouter_key with the general get_api_key ---
-# The rest of the utilities (fetch_html, extract_relevant_links, scrape_pages, build_prompt) remain unchanged.
-
 @st.cache_data(show_spinner=False)
 def fetch_html(url: str) -> str:
     response = requests.get(url, headers=HTTP_HEADERS, timeout=20)
@@ -88,6 +101,7 @@ def fetch_html(url: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def extract_relevant_links(seed_url: str, html: str) -> list[str]:
+    # ... (link extraction logic remains the same) ...
     soup = BeautifulSoup(html, "html.parser")
     anchors = soup.find_all("a")
     candidates: list[str] = []
@@ -111,6 +125,7 @@ def extract_relevant_links(seed_url: str, html: str) -> list[str]:
 
 @st.cache_data(show_spinner=False)
 def scrape_pages(urls: list[str]) -> dict[str, str]:
+    # ... (page scraping logic remains the same) ...
     contents: dict[str, str] = {}
     for u in urls:
         try:
@@ -130,6 +145,7 @@ def scrape_pages(urls: list[str]) -> dict[str, str]:
 
 
 def build_prompt(company_url: str, page_texts: dict[str, str]) -> list[dict[str, str]]:
+    # ... (prompt building logic remains the same) ...
     system_prompt = (
         "You are an assistant that analyzes content from a company's website and "
         "creates a concise, professional brochure in Markdown for prospective customers, "
@@ -154,35 +170,59 @@ def build_prompt(company_url: str, page_texts: dict[str, str]) -> list[dict[str,
     ]
 
 
-# --- Modified generate_brochure to handle multiple providers ---
-def generate_brochure(company_url: str, page_texts: dict[str, str], provider: str) -> str:
+# --- New Cached Function to Fetch Models ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_available_models(provider: str, api_key: str) -> list[str]:
+    """Fetches the list of available models for a given provider/key."""
+    if provider not in LLM_CONFIGS:
+        return []
+
+    config = LLM_CONFIGS[provider]
+    base_url = config['base_url']
+    
+    try:
+        # Use the OpenAI client to query the /models endpoint
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        models_response = client.models.list()
+        
+        # OpenRouter returns models directly. OpenAI returns models with 'id'
+        model_names = [m.id for m in models_response.data]
+        
+        # Simple filter: only include models that support chat completions (optional, but good)
+        # For simplicity, we'll just return all names
+        return sorted(model_names)
+        
+    except APIError as e:
+        # Catch authentication/rate limit errors and inform the user
+        st.warning(f"Could not fetch models for {provider}. Check API key validity. Error: {e.status_code}")
+        return []
+    except Exception as e:
+        st.warning(f"An unexpected error occurred while fetching models: {e}")
+        return []
+
+
+# --- Modified generate_brochure to accept model_name ---
+def generate_brochure(company_url: str, page_texts: dict[str, str], provider: str, model_name: str) -> str:
     
     api_key = get_api_key(provider)
     messages = build_prompt(company_url, page_texts)
 
-    # Configuration mapping: (base_url, model_name)
-    config_map = {
-        "OpenRouter": ("https://openrouter.ai/api/v1", "openrouter/sonoma-dusk-alpha"),
-        "OpenAI": ("https://api.openai.com/v1", "gpt-4-turbo-preview"),
-        "Anthropic": ("https://api.anthropic.com/v1", "claude-3-opus-20240229"), # Note: Anthropic uses a different client/endpoint
-        "Google": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-pro"), # Note: Google uses a different client/endpoint
-    }
-    
-    base_url, model = config_map.get(provider, (None, None))
-    
-    if not base_url:
+    config = LLM_CONFIGS.get(provider)
+    if not config:
         return f"Error: Unsupported provider '{provider}'. Could not configure API client."
         
+    base_url = config['base_url']
+    
     # NOTE: Anthropic and Google APIs require their specific Python client libraries.
-    # For simplicity and to use the existing `openai` import, we will currently ONLY 
-    # support services compatible with the OpenAI-like API structure (OpenAI, OpenRouter, etc.).
-    if provider in ["Anthropic", "Google"]:
-        return f"Provider '{provider}' selected. This demo currently only supports OpenAI-compatible APIs (OpenAI, OpenRouter) for a unified code structure."
+    # For a unified code structure, we only support services compatible with the 
+    # OpenAI-like API structure (OpenAI, OpenRouter).
+    if provider not in LLM_CONFIGS:
+         return f"Provider '{provider}' selected. This demo currently only supports OpenAI-compatible APIs (OpenAI, OpenRouter, etc.) for a unified code structure."
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     
     resp = client.chat.completions.create(
-        model=model,
+        model=model_name, # Use the dynamically selected model
         messages=messages,
         temperature=0.3,
     )
@@ -198,7 +238,7 @@ st.caption(
 )
 
 
-# --- New API Key Configuration Component ---
+# --- API Key Configuration Component ---
 def llm_config_selector():
     st.subheader("API Key & LLM Setup")
     
@@ -219,21 +259,48 @@ def llm_config_selector():
         placeholder="sk-..."
     )
 
-    # 3. Informational Check
-    try:
-        key_status = "✅ Key Loaded" if get_api_key(provider) else "❌ Key Missing"
-    except RuntimeError:
-        key_status = "❌ Key Missing"
-
-    st.info(f"Key Status: **{key_status}**")
+    # 3. Key Status Check and Model Loading
+    model_options = []
     
-    if provider in ["Anthropic", "Google"]:
-         st.warning(f"Note: {provider} requires a different client. Try OpenAI or OpenRouter for this demo.")
+    if provider in LLM_CONFIGS:
+        try:
+            current_key = get_api_key(provider)
+            key_status = "✅ Key Loaded"
+            
+            # Fetch models dynamically only if key is present
+            if current_key:
+                with st.spinner("Fetching models..."):
+                    model_options = fetch_available_models(provider, current_key)
+            
+            if not model_options:
+                st.warning("Could not fetch models. Check your API key or network connection.")
+                default_model = LLM_CONFIGS[provider]['default_model']
+                model_options = [default_model]
+                
+        except RuntimeError:
+            key_status = "❌ Key Missing"
+            default_model = LLM_CONFIGS[provider]['default_model'] if provider in LLM_CONFIGS else "No Model Available"
+            model_options = [default_model]
+            
+        st.info(f"Key Status: **{key_status}**")
+        
+        # 4. Model Selection Box
+        st.selectbox(
+            "Select Model:",
+            options=model_options,
+            key="selected_model",
+            help="The list is dynamically loaded from the API. Only Chat models are recommended."
+        )
+
+    else:
+        # For non-compatible providers like Anthropic/Google
+        st.warning(f"Note: {provider} requires a different client. Try OpenAI or OpenRouter for this demo.")
+        st.session_state["selected_model"] = "N/A" # Clear model state for incompatible providers
 
 
 # Sidebar inputs
 with st.sidebar:
-    llm_config_selector() # Call the new configuration function
+    llm_config_selector() # Call the configuration function
     st.markdown("---")
     st.subheader("Website Input")
     
@@ -248,8 +315,10 @@ col_left, col_right = st.columns([1, 1])
 if run:
     if not input_url:
         st.error("Please enter a company website URL.")
+    elif st.session_state["llm_provider"] not in LLM_CONFIGS:
+        st.error(f"The selected provider ({st.session_state['llm_provider']}) is not supported for LLM generation in this version.")
     else:
-        # Validate URL
+        # Validate URL and proceed
         parsed = urlparse(input_url)
         if not parsed.scheme or not parsed.netloc:
             st.error("Please provide a valid URL including http:// or https://.")
@@ -257,6 +326,7 @@ if run:
             try:
                 # Check for API key before starting long processes
                 provider = st.session_state["llm_provider"]
+                model_name = st.session_state["selected_model"]
                 get_api_key(provider) # This will raise RuntimeError if key is missing
 
                 # --- Core Process ---
@@ -267,15 +337,16 @@ if run:
                 with st.spinner("Scraping relevant pages..."):
                     contents = scrape_pages(links)
                 
-                # Use the selected provider in the generation step
-                with st.spinner(f"Generating brochure with {provider}..."):
-                    brochure_md = generate_brochure(input_url, contents, provider)
+                # Use the selected provider and model in the generation step
+                with st.spinner(f"Generating brochure with {provider}/{model_name}..."):
+                    brochure_md = generate_brochure(input_url, contents, provider, model_name)
                 # --- End Core Process ---
 
                 # Display Results
                 with col_left:
                     st.subheader("Status & Raw Data")
                     st.markdown("**Relevant links found:**")
+                    # ... (display links logic) ...
                     if links:
                         for l in links:
                             st.write(f"- {l}")
@@ -296,7 +367,7 @@ if run:
                          st.error(brochure_md)
                     elif brochure_md.strip():
                         st.markdown(brochure_md)
-                        st.success("Brochure generated successfully.")
+                        st.success("Brochure generated successfully using **" + model_name + "**.")
                     else:
                         st.warning("No content returned by the model. Try again or adjust the URL.")
 
